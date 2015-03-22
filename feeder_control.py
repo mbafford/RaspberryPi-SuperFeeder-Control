@@ -1,0 +1,195 @@
+#!/usr/bin/env python
+
+import time
+import yaml
+import os
+import sys
+import pytz
+from datetime import datetime,timedelta
+from pytz import timezone
+
+DEBUG="--debug" in sys.argv
+
+# how often the program should sleep between checking if a feeding is necessary
+# having this be less than FEEDER_RESET_TIME_SECONDS doesn't make much sense as
+# any feed attempts will need to be spaced out by that amount anyway
+LOOP_SLEEP_TIME_SECONDS=5 if DEBUG else 60
+
+STATUS_FILE = os.path.expanduser( "./feeder_status" )
+
+# the GPIO pin the feeder relay is connected to
+PIN_FEEDER=18
+
+# time to complete one feeding - this can be longer than needed, since the super-feeder has
+# an internal timer that has been adjusted for the desired amount of food
+FEEDER_CYCLE_TIME_SECONDS=30 
+
+# time needed to reset the super-feeder's internal cooldown/reset timer
+# this timer keeps the super-feeder from feeding multiple times during a brown-out
+# but also means our feeding attempts have to be delayed by at least this much - the
+# manual suggests 1-2 minutes, so we're giving a little bit extra
+FEEDER_RESET_TIME_SECONDS=150 # 2m 30s
+
+# the feeding schedule timezone - this assumes the RaspberryPi will be running on GMT clock
+# but we want to program the feeding schedule using local timezone
+RUN_TIMEZONE='US/Eastern'
+
+# feeding schedule, per-day - times are in 24 hour time (quoted so Python doesn't assume octal)
+feedingSchedule = [ '0700', '0830', '1800', '2030' ]
+
+# maximum number of feedings to catch up on if there is a period of time where the feeder was unable
+# to run - the first time the feeder is run this will be ignored, and only a feeding within the past 
+# 10 minutes will be run - otherwise this many feedings between the last feed run and the current time
+# will be run if there is a lapse in feedings
+MAX_CATCHUP_FEEDINGS = 6
+
+def checkIsPi():
+    isPi = os.uname()[4].startswith("arm")
+    if isPi:
+        import RPi.GPIO as gpio
+        gpio.setmode(gpio.BCM)
+        gpio.setup(PIN_FEEDER, gpio.OUT)
+        gpio.output(PIN_FEEDER, gpio.HIGH)
+    else:
+        print("*** Not really running on a Raspberry Pi. Feedings will be simulated.")
+    return isPi
+
+IS_PI=checkIsPi()
+
+# when first starting or re-starting, read in the last
+# known status information
+def readStatusFile():
+    try:
+        if not os.path.exists( STATUS_FILE ):
+            print("Status file does not yet exist. Returning empty status information.")
+            return {}
+
+        with open( STATUS_FILE, "r" ) as f:
+            ret = yaml.load( f )
+            if not ret:
+                print("Unable to load status file! Returning empty document.")
+                ret = {}
+            return ret
+    except:
+        print("Unable to open status file! Exiting unhappily.")
+        sys.exit(1)
+
+def writeStatusFile( statusInfo ):
+    try:
+        with open( STATUS_FILE, "w" ) as f:
+            f.write( yaml.dump( statusInfo ) )
+    except:
+        print("Unable to write status file. Will continue running, but this isn't good.")
+        return
+
+def daterange(start_date, end_date):
+    for n in range(int ((end_date - start_date).days + 1)):
+        yield start_date + timedelta(n)
+
+def findFeedingsSinceLastRun( now, lastFeed ):
+    ret = []
+
+    for date in daterange( lastFeed, now + timedelta(1) ):
+        date = date.replace( microsecond=0, second=0, minute=0, hour=0 )
+
+        for feed in feedingSchedule:
+            hours = int(feed)/100
+            mins  = int(feed) % (hours * 100)
+
+            check = date.replace(hour=hours, minute=mins)
+            
+            if check > lastFeed and check < now:
+                ret.append( check )
+    return ret
+
+def triggerFeeding():
+    if IS_PI:
+        import RPi.GPIO as gpio
+        print("    Turning on GPIO pin")
+        gpio.output(PIN_FEEDER, gpio.LOW)
+        print("    Sleeping for %d seconds while cycle completes" % ( FEEDER_CYCLE_TIME_SECONDS ) )
+        time.sleep(FEEDER_CYCLE_TIME_SECONDS)
+        print("    Turning off GPIO pin")
+        gpio.output(PIN_FEEDER, gpio.HIGH)
+    else:
+        print('    Not really a RaspberryPi. "Feeding" the cats.')
+
+def getNow():
+    u=datetime.utcnow()
+    u=u.replace(tzinfo=pytz.utc)
+    u=u.astimezone(timezone(RUN_TIMEZONE))
+    return u
+
+def getTZAwareTime( statusInfo, field ):
+    time = statusInfo.get(field, None)
+    if not time: return None
+
+    if not time.tzinfo: # assume time stored without timezone information is in UTC
+        time = time.replace(tzinfo=pytz.utc)
+        
+    return time.astimezone(timezone(RUN_TIMEZONE))
+
+def runLoop():
+    statusInfo = readStatusFile()
+    firstRun = True
+
+    while True:
+        try:
+            justFed = False
+            now = getNow()
+
+            lastFeeding = getTZAwareTime(statusInfo, 'lastFeeding') 
+            lastRun     = getTZAwareTime(statusInfo, 'lastRun') 
+
+            if DEBUG or firstRun:
+                firstRun = False
+                print("Current Time: %s - Last Feeding: %s - Last Run: %s" % ( now, lastFeeding, lastRun ) )
+
+            missedFeedings = []
+            if lastFeeding:
+                missedFeedings = findFeedingsSinceLastRun( now, lastFeeding )
+            else:
+                missedFeedings = findFeedingsSinceLastRun( now, now.replace(microsecond=0, second=0, minute=0, hour=0) )
+                if not missedFeedings: continue
+
+                if (now - missedFeedings[-1]).seconds < 60*10:
+                    print("Never run before and last feeding was just 10 minutes ago. Assuming a feeding should happen now.")
+                    missedFeedings = missedFeedings[-1:]
+                else:
+                    print("Never run before and no recent missed feeding. Pretending we ran now and will run on next scheduled run.")
+                    statusInfo['lastFeeding'] = datetime.now()
+                    statusInfo['lastRun']     = datetime.now()
+                    writeStatusFile( statusInfo )
+                    justFed = True
+                    continue
+
+            if missedFeedings:
+                print(now-lastRun)
+                if lastRun and (now-lastRun).seconds < FEEDER_RESET_TIME_SECONDS:
+                    print("Need to feed, but most recent feeding was too recent.")
+                    continue
+
+                print("Missed feedings to catch up on: ")
+                for feeding in missedFeedings: print("    %s" % feeding) 
+                
+                if len(missedFeedings) > MAX_CATCHUP_FEEDINGS:
+                    print("Skipping %d missed feedings. Maximum catchup feedings set to: %d" 
+                            % ( len(missedFeedings)-MAX_CATCHUP_FEEDINGS, MAX_CATCHUP_FEEDINGS ))
+                    missedFeedings = missedFeedings[-1*MAX_CATCHUP_FEEDINGS:]
+
+                feeding = missedFeedings[0]
+
+                print("Running feeding scheduled for %s" % ( feeding ))
+
+                triggerFeeding()
+                statusInfo['lastRun']     = now
+                statusInfo['lastFeeding'] = feeding
+                writeStatusFile( statusInfo )
+                justFed = True
+
+        finally:
+            if DEBUG or justFed: print("Sleeping...")
+            time.sleep(LOOP_SLEEP_TIME_SECONDS)
+
+if __name__ == '__main__':
+    runLoop()
