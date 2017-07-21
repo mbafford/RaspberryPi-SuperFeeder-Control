@@ -35,7 +35,8 @@ FEEDER_RESET_TIME_SECONDS=150 # 2m 30s
 RUN_TIMEZONE='US/Eastern'
 
 # feeding schedule, per-day - times are in 24 hour time (quoted so Python doesn't assume octal)
-feedingSchedule = [ '0700', '0830', '1800', '2030' ]
+# 12 grams each time - targeting 100 grams per day (50 per cat)
+feedingSchedule = [ '0600', '0610', '1200', '1210', '1500', '1510', '1900', '1910' ];
 
 # maximum number of feedings to catch up on if there is a period of time where the feeder was unable
 # to run - the first time the feeder is run this will be ignored, and only a feeding within the past 
