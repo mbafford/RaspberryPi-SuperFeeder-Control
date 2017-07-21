@@ -88,7 +88,7 @@ def daterange(start_date, end_date):
     for n in range(int ((end_date - start_date).days + 1)):
         yield start_date + timedelta(n)
 
-def findFeedingsSinceLastRun( now, lastFeed ):
+def findMissedFeedingsSinceLastRun( now, lastFeed ):
     ret = []
 
     for date in daterange( lastFeed, now + timedelta(1) ):
@@ -103,6 +103,23 @@ def findFeedingsSinceLastRun( now, lastFeed ):
             if check > lastFeed and check < now:
                 ret.append( check )
     return ret
+
+def findNearestScheduledFeeding( now ):
+    for date in daterange( now, now + timedelta(1) ):
+        date = date.replace( microsecond=0, second=0, minute=0, hour=0 )
+
+        for feed in feedingSchedule:
+            hours = int(feed)/100
+            mins  = int(feed) % (hours * 100)
+
+            check = date.replace(hour=hours, minute=mins)
+            
+            if check > now: return check
+
+    # this doesn't make any sense - since the feedings are done based
+    # on wallclock time, the only way this would happen is if there is
+    # no defined schedule  
+    return None
 
 def triggerFeeding():
     if IS_PI:
@@ -143,18 +160,23 @@ def runLoop():
 
             lastFeeding = getTZAwareTime(statusInfo, 'lastFeeding') 
             lastRun     = getTZAwareTime(statusInfo, 'lastRun') 
+            
+            nextScheduledFeeding = findNearestScheduledFeeding( now )
 
             if DEBUG or firstRun:
                 firstRun = False
-                print("Current Time: %s - Last Feeding: %s - Last Run: %s" % ( now, lastFeeding, lastRun ) )
+		print("Feeding schedule: %s" % ( " ".join( feedingSchedule ) ))
+                print("Current Time: %s - Last Feeding: %s - Last Run: %s - Next Feeding: %s" % ( now, lastFeeding, lastRun, nextScheduledFeeding ) )
 
             missedFeedings = []
             if lastFeeding:
-                missedFeedings = findFeedingsSinceLastRun( now, lastFeeding )
+                missedFeedings = findMissedFeedingsSinceLastRun( now, lastFeeding )
             else:
-                missedFeedings = findFeedingsSinceLastRun( now, now.replace(microsecond=0, second=0, minute=0, hour=0) )
+                # find all feedings for today since this is the first run of the program
+                missedFeedings = findMissedFeedingsSinceLastRun( now, now.replace(microsecond=0, second=0, minute=0, hour=0) )
                 if not missedFeedings: continue
 
+                # for the first run, only, run if being started within 10 minutes after the last scheduled feeding
                 if (now - missedFeedings[-1]).seconds < 60*10:
                     print("Never run before and last feeding was just 10 minutes ago. Assuming a feeding should happen now.")
                     missedFeedings = missedFeedings[-1:]
@@ -167,20 +189,26 @@ def runLoop():
                     continue
 
             if missedFeedings:
-                print(now-lastRun)
+                numMissed = len(missedFeedings)
+                skippedFeedings = []
+                if len(missedFeedings) > MAX_CATCHUP_FEEDINGS:
+                    missedFeedings = missedFeedings[-1*MAX_CATCHUP_FEEDINGS:]
+                    skippedFeedings = missedFeedings[0:-1*MAX_CATCHUP_FEEDINGS]
+
                 if lastRun and (now-lastRun).seconds < FEEDER_RESET_TIME_SECONDS:
                     print("Need to feed, but most recent feeding was too recent.")
                     continue
-
+                elif skippedFeedings:
+                    print("Skipping %d missed feedings. Maximum catchup feedings set to: %d" 
+                            % ( len(skippedFeedings), MAX_CATCHUP_FEEDINGS ))
+ 
                 print("Missed feedings to catch up on: ")
                 for feeding in missedFeedings: print("    %s" % feeding) 
-                
-                if len(missedFeedings) > MAX_CATCHUP_FEEDINGS:
-                    print("Skipping %d missed feedings. Maximum catchup feedings set to: %d" 
-                            % ( len(missedFeedings)-MAX_CATCHUP_FEEDINGS, MAX_CATCHUP_FEEDINGS ))
-                    missedFeedings = missedFeedings[-1*MAX_CATCHUP_FEEDINGS:]
-
+               
                 feeding = missedFeedings[0]
+
+                if len(missedFeedings) > 1:
+                    nextScheduledFeeding = missedFeedings[1]
 
                 print("Running feeding scheduled for %s" % ( feeding ))
 
