@@ -47,6 +47,7 @@ def checkIsPi():
     isPi = os.uname()[4].startswith("arm")
     if isPi:
         import RPi.GPIO as gpio
+	gpio.setwarnings(False)
         gpio.setmode(gpio.BCM)
         gpio.setup(PIN_FEEDER, gpio.OUT)
         gpio.output(PIN_FEEDER, gpio.HIGH)
@@ -105,6 +106,7 @@ def findFeedingsSinceLastRun( now, lastFeed ):
 def triggerFeeding():
     if IS_PI:
         import RPi.GPIO as gpio
+	gpio.setwarnings(False)
         print("    Turning on GPIO pin")
         gpio.output(PIN_FEEDER, gpio.LOW)
         print("    Sleeping for %d seconds while cycle completes" % ( FEEDER_CYCLE_TIME_SECONDS ) )
