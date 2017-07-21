@@ -8,6 +8,7 @@ import pytz
 from datetime import datetime,timedelta
 from pytz import timezone
 
+
 DEBUG="--debug" in sys.argv
 
 # how often the program should sleep between checking if a feeding is necessary
@@ -44,45 +45,129 @@ feedingSchedule = [ '0600', '0610', '1200', '1210', '1500', '1510', '1900', '191
 # will be run if there is a lapse in feedings
 MAX_CATCHUP_FEEDINGS = 6
 
-def checkIsPi():
-    isPi = os.uname()[4].startswith("arm")
-    if isPi:
-        import RPi.GPIO as gpio
-	gpio.setwarnings(False)
-        gpio.setmode(gpio.BCM)
-        gpio.setup(PIN_FEEDER, gpio.OUT)
-        gpio.output(PIN_FEEDER, gpio.HIGH)
-    else:
-        print("*** Not really running on a Raspberry Pi. Feedings will be simulated.")
-    return isPi
+class RaspPi:
+    def checkIsPi():
+        isPi = os.uname()[4].startswith("arm")
+        if isPi:
+            import RPi.GPIO as gpio
+            gpio.setwarnings(False)
+            gpio.setmode(gpio.BCM)
+            gpio.setup(PIN_FEEDER, gpio.OUT)
+            gpio.output(PIN_FEEDER, gpio.HIGH)
+        else:
+            print("*** Not really running on a Raspberry Pi. Feedings will be simulated.")
+        return isPi
+    
+    @staticmethod
+    def setPINLow(pin, value):
+        if IS_PI:
+            print("Setting GPIO pin [%d] to [%d]" % (pin,value)) 
+            print("Setting GPIO pin [" + pin + "] to [" + value + "]");
+            import RPi.GPIO as gpio
+            gpio.setwarnings(False)
+            gpio.output(PIN_FEEDER, gpio.LOW)
+        else:
+            print("Not really a RaspberryPi. Would be setting GPIO pin [%d] to [%d], but not" % (pin,value)) 
+   
+    IS_PI=checkIsPi()
 
-IS_PI=checkIsPi()
 
-# when first starting or re-starting, read in the last
-# known status information
-def readStatusFile():
-    try:
-        if not os.path.exists( STATUS_FILE ):
-            print("Status file does not yet exist. Returning empty status information.")
-            return {}
+class Status:
+    filename = ""
+    data     = {}
 
-        with open( STATUS_FILE, "r" ) as f:
-            ret = yaml.load( f )
-            if not ret:
-                print("Unable to load status file! Returning empty document.")
-                ret = {}
-            return ret
-    except:
-        print("Unable to open status file! Exiting unhappily.")
-        sys.exit(1)
+    def __init__(self,filename):
+        self.filename = filename
 
-def writeStatusFile( statusInfo ):
-    try:
-        with open( STATUS_FILE, "w" ) as f:
-            f.write( yaml.dump( statusInfo ) )
-    except:
-        print("Unable to write status file. Will continue running, but this isn't good.")
-        return
+    # when first starting or re-starting, read in the last
+    # known status information
+    def readStatusFile(self):
+        try:
+            if not os.path.exists( self.filename ):
+                print("Status file [%s] does not yet exist. Returning empty status information." % ( self.filename ))
+                self.data = {}
+                return
+
+            with open( STATUS_FILE, "r" ) as f:
+                data = yaml.load( f )
+                if not data:
+                    print("Unable to load status file [%s]! Returning empty document." % (self.filename))
+                    self.data = {}
+                self.data = data
+                return
+
+        except Exception as ex:
+            print("Unable to open status file [%s]! Exiting unhappily." % (self.filename))
+            print(ex)
+            sys.exit(1)
+
+    def writeStatusFile( self ):
+        try:
+            # for such a small configuration file don't use aliases, which just make
+            # the file harder to read with no major benefit (cost or size)
+            noalias_dumper = yaml.dumper.SafeDumper
+            noalias_dumper.ignore_aliases = lambda self, data: True
+            with open( self.filename, "w" ) as f:
+                f.write( yaml.dump( self.data, Dumper=noalias_dumper ) )
+        except:
+            print("Unable to write status file. Will continue running, but this isn't good.")
+            return
+
+    @staticmethod
+    def getTZAwareTime( statusInfo, field ):
+        time = statusInfo.get(field, None)
+        if not time: return None
+
+        if not time.tzinfo: # assume time stored without timezone information is in UTC
+            time = time.replace(tzinfo=pytz.utc)
+            
+        return time.astimezone(timezone(RUN_TIMEZONE))
+
+    def getLastFeeding(self):
+        return Status.getTZAwareTime(self.data, 'lastFeeding') 
+
+    def getLastRun(self):
+        return Status.getTZAwareTime(self.data, 'lastRun') 
+
+    # Updates the last feeding date/time to the provided value
+    def setLastFeeding(self, ts):
+        self.data['lastFeeding'] = ts
+
+    # Updates the last run date/time to the provided value
+    def setLastRun(self, ts):
+        self.data['lastRun'] = ts
+
+    def getMissedFeedings(self, now):
+        lastFeeding = self.getLastFeeding()
+
+        if lastFeeding:
+            # if we recorded a prior feeding, find all scheduled feedings between that time and now
+            missedFeedings = findMissedFeedingsSinceLastRun( now, lastFeeding )
+        else:
+            # for the first run, catch up on recent scheduled feedings - if nothing was scheduled
+            # in the defined time period, then nothing will be returned
+            missedFeedings = findMissedFeedingsSinceLastRun( now, now - timedelta(minutes=300) )
+
+            if missedFeedings:
+                print("Very first run and a feeding was scheduled to happen recently. Running that feeding now.")
+                missedFeedings = missedFeedings[0:1]
+            else:
+                print("Very first run and no recent scheduled feeding. Not feeding now. Future feedings will happen on normal schedule.")
+                missedFeedings = []
+        
+        # if too many feedings are missed, cap the feeding limit at MAX_CATCHUP_FEEDINGS
+        # and start feeding from the oldest feeding
+        numMissed = len(missedFeedings)
+        if len(missedFeedings) > MAX_CATCHUP_FEEDINGS:
+            totalMissed = len(missedFeedings)
+
+            skippedFeedings = missedFeedings[0:-1*MAX_CATCHUP_FEEDINGS]
+            missedFeedings  = missedFeedings[-1*MAX_CATCHUP_FEEDINGS:]
+
+            print("Missed %d feedings since %s. Skipping %d of them, and running %d (max catch-up feedings is set to %d)." \
+                    % ( totalMissed, lastFeeding, len(skippedFeedings), len(missedFeedings), MAX_CATCHUP_FEEDINGS))
+
+        return missedFeedings
 
 def daterange(start_date, end_date):
     for n in range(int ((end_date - start_date).days + 1)):
@@ -122,15 +207,11 @@ def findNearestScheduledFeeding( now ):
     return None
 
 def triggerFeeding():
-    if IS_PI:
-        import RPi.GPIO as gpio
-	gpio.setwarnings(False)
-        print("    Turning on GPIO pin")
-        gpio.output(PIN_FEEDER, gpio.LOW)
+    if RaspPi.IS_PI:
+        RaspPi.setPIN(PIN_FEEDER, gpio.LOW)
         print("    Sleeping for %d seconds while cycle completes" % ( FEEDER_CYCLE_TIME_SECONDS ) )
         time.sleep(FEEDER_CYCLE_TIME_SECONDS)
-        print("    Turning off GPIO pin")
-        gpio.output(PIN_FEEDER, gpio.HIGH)
+        RaspPi.setPIN(PIN_FEEDER, gpio.HIGH)
     else:
         print('    Not really a RaspberryPi. "Feeding" the cats.')
 
@@ -140,17 +221,9 @@ def getNow():
     u=u.astimezone(timezone(RUN_TIMEZONE))
     return u
 
-def getTZAwareTime( statusInfo, field ):
-    time = statusInfo.get(field, None)
-    if not time: return None
 
-    if not time.tzinfo: # assume time stored without timezone information is in UTC
-        time = time.replace(tzinfo=pytz.utc)
-        
-    return time.astimezone(timezone(RUN_TIMEZONE))
-
-def runLoop():
-    statusInfo = readStatusFile()
+def runLoop(status):
+    status.readStatusFile()
     firstRun = True
 
     while True:
@@ -158,69 +231,53 @@ def runLoop():
             justFed = False
             now = getNow()
 
-            lastFeeding = getTZAwareTime(statusInfo, 'lastFeeding') 
-            lastRun     = getTZAwareTime(statusInfo, 'lastRun') 
-            
+            lastFeeding = status.getLastFeeding() 
+            lastRun     = status.getLastRun()
+       
             nextScheduledFeeding = findNearestScheduledFeeding( now )
+            missedFeedings       = status.getMissedFeedings   ( now )
 
+            # no sense processing anything if we're still in the feeder sleep window (so the feeder resets)
+            if lastRun and (now-lastRun).seconds < FEEDER_RESET_TIME_SECONDS:
+                if missedFeedings: print("Sleeping %d seconds until feeder has reset" % (FEEDER_RESET_TIME_SECONDS - (now-lastRun).seconds))
+                continue
+ 
             if DEBUG or firstRun:
                 firstRun = False
-		print("Feeding schedule: %s" % ( " ".join( feedingSchedule ) ))
+                print("Feeding schedule: %s" % ( " ".join( feedingSchedule ) ))
                 print("Current Time: %s - Last Feeding: %s - Last Run: %s - Next Feeding: %s" % ( now, lastFeeding, lastRun, nextScheduledFeeding ) )
+       
+            # if we've never fed before, and never run before, and there are no "missed"
+            # feedings, then mark the last run and last feed as now so future calculations will
+            # be based off of this timestamp
+            if not lastFeeding and not lastRun and not missedFeedings:
+                status.setLastFeeding ( now )
+                status.setLastRun     ( now )
+                status.writeStatusFile( )
+                justFed = True
 
-            missedFeedings = []
-            if lastFeeding:
-                missedFeedings = findMissedFeedingsSinceLastRun( now, lastFeeding )
-            else:
-                # find all feedings for today since this is the first run of the program
-                missedFeedings = findMissedFeedingsSinceLastRun( now, now.replace(microsecond=0, second=0, minute=0, hour=0) )
-                if not missedFeedings: continue
-
-                # for the first run, only, run if being started within 10 minutes after the last scheduled feeding
-                if (now - missedFeedings[-1]).seconds < 60*10:
-                    print("Never run before and last feeding was just 10 minutes ago. Assuming a feeding should happen now.")
-                    missedFeedings = missedFeedings[-1:]
-                else:
-                    print("Never run before and no recent missed feeding. Pretending we ran now and will run on next scheduled run.")
-                    statusInfo['lastFeeding'] = datetime.now()
-                    statusInfo['lastRun']     = datetime.now()
-                    writeStatusFile( statusInfo )
-                    justFed = True
-                    continue
-
-            if missedFeedings:
-                numMissed = len(missedFeedings)
-                skippedFeedings = []
-                if len(missedFeedings) > MAX_CATCHUP_FEEDINGS:
-                    missedFeedings = missedFeedings[-1*MAX_CATCHUP_FEEDINGS:]
-                    skippedFeedings = missedFeedings[0:-1*MAX_CATCHUP_FEEDINGS]
-
-                if lastRun and (now-lastRun).seconds < FEEDER_RESET_TIME_SECONDS:
-                    print("Need to feed, but most recent feeding was too recent.")
-                    continue
-                elif skippedFeedings:
-                    print("Skipping %d missed feedings. Maximum catchup feedings set to: %d" 
-                            % ( len(skippedFeedings), MAX_CATCHUP_FEEDINGS ))
- 
+            # otherwise, there's a feeding to process - make sure it's ok to run that now
+            elif missedFeedings:
                 print("Missed feedings to catch up on: ")
                 for feeding in missedFeedings: print("    %s" % feeding) 
                
                 feeding = missedFeedings[0]
 
-                if len(missedFeedings) > 1:
-                    nextScheduledFeeding = missedFeedings[1]
-
                 print("Running feeding scheduled for %s" % ( feeding ))
 
                 triggerFeeding()
-                statusInfo['lastRun']     = now
-                statusInfo['lastFeeding'] = feeding
-                writeStatusFile( statusInfo )
+                status.setLastFeeding ( feeding )
+                status.setLastRun     ( now     )
+                status.writeStatusFile( )
                 justFed = True
+        
+        except Exception as ex:
+            print(ex)
 
         finally:
             if DEBUG or justFed: print("Sleeping...")
             time.sleep(LOOP_SLEEP_TIME_SECONDS)
 
 if __name__ == '__main__':
-    runLoop()
+    status = Status(STATUS_FILE)
+    runLoop( status )
