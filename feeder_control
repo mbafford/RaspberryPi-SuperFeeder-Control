@@ -91,10 +91,9 @@ class RaspPi:
         return isPi
     
     @staticmethod
-    def setPINLow(pin, value):
-        if IS_PI:
+    def setPIN(pin, value):
+        if RaspPi.IS_PI:
             print("Setting GPIO pin [%d] to [%d]" % (pin,value)) 
-            print("Setting GPIO pin [" + pin + "] to [" + value + "]");
             import RPi.GPIO as gpio
             gpio.setwarnings(False)
             gpio.output(PIN_FEEDER, gpio.LOW)
@@ -254,6 +253,7 @@ def findNearestScheduledFeeding( now ):
 
 def triggerFeeding():
     if RaspPi.IS_PI:
+        import RPi.GPIO as gpio
         RaspPi.setPIN(PIN_FEEDER, gpio.LOW)
         print("    Sleeping for %d seconds while cycle completes" % ( FEEDER_CYCLE_TIME_SECONDS ) )
         status.sleep('feeding', FEEDER_CYCLE_TIME_SECONDS)
