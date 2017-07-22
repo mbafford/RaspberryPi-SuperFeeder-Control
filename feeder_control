@@ -8,6 +8,9 @@ import pytz
 from datetime import datetime,timedelta
 from pytz import timezone
 
+import json
+import threading
+import BaseHTTPServer
 
 DEBUG="--debug" in sys.argv
 
@@ -44,6 +47,35 @@ feedingSchedule = [ '0600', '0610', '1200', '1210', '1500', '1510', '1900', '191
 # 10 minutes will be run - otherwise this many feedings between the last feed run and the current time
 # will be run if there is a lapse in feedings
 MAX_CATCHUP_FEEDINGS = 6
+
+def makeStatusRequestHandler(statusObj):
+    class StatusHTTPRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+        status = statusObj
+
+        def do_GET(self):
+            if self.path == "/status":
+                now = getNow()
+
+                data = {}
+                data['now']      = str(now)
+                data['status']   = status.getStatus()
+                data['last']     = { 'run': str(status.getLastRun()), 'feeding': str(status.getLastFeeding()) }
+                data['schedule'] = feedingSchedule
+                data['next']     = str( findNearestScheduledFeeding( now ) )
+                data['missed']   = [ str(f) for f in status.getMissedFeedings( now, False ) ]
+
+                self.send_response(200)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(json.dumps(data))
+                self.wfile.write("\r\n")
+            else:
+                self.send_response(404)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write("%s\r\n" % ( json.dumps({"error": "Only the endpoint /status is supported"}) ))
+
+    return StatusHTTPRequestHandler
 
 class RaspPi:
     def checkIsPi():
@@ -123,6 +155,12 @@ class Status:
             
         return time.astimezone(timezone(RUN_TIMEZONE))
 
+    def getStatus(self):
+        return self.data.get('status', 'initializing')
+
+    def setStatus(self, status):
+        self.data['status'] = status
+
     def getLastFeeding(self):
         return Status.getTZAwareTime(self.data, 'lastFeeding') 
 
@@ -137,7 +175,7 @@ class Status:
     def setLastRun(self, ts):
         self.data['lastRun'] = ts
 
-    def getMissedFeedings(self, now):
+    def getMissedFeedings(self, now, printStatus=True):
         lastFeeding = self.getLastFeeding()
 
         if lastFeeding:
@@ -149,10 +187,10 @@ class Status:
             missedFeedings = findMissedFeedingsSinceLastRun( now, now - timedelta(minutes=300) )
 
             if missedFeedings:
-                print("Very first run and a feeding was scheduled to happen recently. Running that feeding now.")
+                if printStatus: print("Very first run and a feeding was scheduled to happen recently. Running that feeding now.")
                 missedFeedings = missedFeedings[0:1]
             else:
-                print("Very first run and no recent scheduled feeding. Not feeding now. Future feedings will happen on normal schedule.")
+                if printStatus: print("Very first run and no recent scheduled feeding. Not feeding now. Future feedings will happen on normal schedule.")
                 missedFeedings = []
         
         # if too many feedings are missed, cap the feeding limit at MAX_CATCHUP_FEEDINGS
@@ -168,6 +206,14 @@ class Status:
                     % ( totalMissed, lastFeeding, len(skippedFeedings), len(missedFeedings), MAX_CATCHUP_FEEDINGS))
 
         return missedFeedings
+
+    # allow for sleeping for X seconds, but also updating the status so any calling apps can
+    # easily see how long is left on the sleep - sleeps in 1 second intervals instead of sleeping
+    # for the full sleep time in a single go
+    def sleep(self, status, seconds):
+        for i in range(0, seconds):
+            self.setStatus("%s (%d seconds)" % ( status, seconds-i ))
+            time.sleep( 1 )
 
 def daterange(start_date, end_date):
     for n in range(int ((end_date - start_date).days + 1)):
@@ -210,10 +256,11 @@ def triggerFeeding():
     if RaspPi.IS_PI:
         RaspPi.setPIN(PIN_FEEDER, gpio.LOW)
         print("    Sleeping for %d seconds while cycle completes" % ( FEEDER_CYCLE_TIME_SECONDS ) )
-        time.sleep(FEEDER_CYCLE_TIME_SECONDS)
+        status.sleep('feeding', FEEDER_CYCLE_TIME_SECONDS)
         RaspPi.setPIN(PIN_FEEDER, gpio.HIGH)
     else:
         print('    Not really a RaspberryPi. "Feeding" the cats.')
+        status.sleep('feeding', FEEDER_CYCLE_TIME_SECONDS)
 
 def getNow():
     u=datetime.utcnow()
@@ -224,7 +271,9 @@ def getNow():
 
 def runLoop(status):
     status.readStatusFile()
+
     firstRun = True
+    feederNeedsReset  = False
 
     while True:
         try:
@@ -234,13 +283,14 @@ def runLoop(status):
             lastFeeding = status.getLastFeeding() 
             lastRun     = status.getLastRun()
        
-            nextScheduledFeeding = findNearestScheduledFeeding( now )
-            missedFeedings       = status.getMissedFeedings   ( now )
-
             # no sense processing anything if we're still in the feeder sleep window (so the feeder resets)
             if lastRun and (now-lastRun).seconds < FEEDER_RESET_TIME_SECONDS:
                 if missedFeedings: print("Sleeping %d seconds until feeder has reset" % (FEEDER_RESET_TIME_SECONDS - (now-lastRun).seconds))
+                feederNeedsReset = True
                 continue
+
+            nextScheduledFeeding = findNearestScheduledFeeding( now )
+            missedFeedings       = status.getMissedFeedings   ( now )
  
             if DEBUG or firstRun:
                 firstRun = False
@@ -265,6 +315,7 @@ def runLoop(status):
 
                 print("Running feeding scheduled for %s" % ( feeding ))
 
+                status.setStatus('feeding')
                 triggerFeeding()
                 status.setLastFeeding ( feeding )
                 status.setLastRun     ( now     )
@@ -276,8 +327,22 @@ def runLoop(status):
 
         finally:
             if DEBUG or justFed: print("Sleeping...")
-            time.sleep(LOOP_SLEEP_TIME_SECONDS)
+
+            if feederNeedsReset:
+                status.setStatus('sleeping (feeder resetting)')
+            else:
+                status.setStatus('sleeping')
+            
+            status.sleep('sleeping', LOOP_SLEEP_TIME_SECONDS)
 
 if __name__ == '__main__':
     status = Status(STATUS_FILE)
+
+    httpServer = BaseHTTPServer.HTTPServer(('', 8484), makeStatusRequestHandler(status) )
+    thread = threading.Thread( target = httpServer.serve_forever )
+    thread.daemon = True
+    print("Starting HTTP server thread")
+    thread.start()
+    print("After starting HTTP server thread")
+
     runLoop( status )
